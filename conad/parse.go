@@ -78,10 +78,19 @@ func euros(whole, cents string) *float64 {
 	return &v
 }
 
-// number reads a number written the Italian way ("0,2", "1.250,5").
+// thousands matches a number whose dots only group thousands: «1.250», «12.500.000».
+var thousands = regexp.MustCompile(`^\d{1,3}(\.\d{3})+$`)
+
+// number reads a number written the Italian way («0,2», «1.250,5»), and a plain «1.5».
 func number(s string) (float64, bool) {
-	s = strings.ReplaceAll(strings.TrimSpace(s), ".", "")
-	v, err := strconv.ParseFloat(strings.ReplaceAll(s, ",", "."), 64)
+	s = strings.TrimSpace(s)
+	switch {
+	case strings.Contains(s, ","):
+		s = strings.ReplaceAll(strings.ReplaceAll(s, ".", ""), ",", ".")
+	case thousands.MatchString(s):
+		s = strings.ReplaceAll(s, ".", "")
+	}
+	v, err := strconv.ParseFloat(s, 64)
 	return v, err == nil
 }
 
@@ -189,15 +198,10 @@ var errNoProduct = errors.New("conad: the page has no product")
 // the size in it and the nutrition table.
 func parseProduct(page string) (product, error) {
 	var ld struct {
-		Type  string `json:"@type"`
-		SKU   string `json:"sku"`
-		Brand struct {
-			Name string `json:"name"`
-		} `json:"brand"`
-		Offers struct {
-			Price        string `json:"price"`
-			Availability string `json:"availability"`
-		} `json:"offers"`
+		Type   string          `json:"@type"`
+		SKU    json.Number     `json:"sku"`
+		Brand  json.RawMessage `json:"brand"`
+		Offers json.RawMessage `json:"offers"`
 	}
 	found := false
 	for _, m := range jsonLD.FindAllStringSubmatch(page, -1) {
@@ -210,7 +214,7 @@ func parseProduct(page string) (product, error) {
 		}
 	}
 	var p product
-	if !found || ld.SKU == "" {
+	if !found || ld.SKU.String() == "" {
 		return p, errNoProduct
 	}
 	name := ""
@@ -220,11 +224,12 @@ func parseProduct(page string) (product, error) {
 	if name == "" {
 		return p, errNoProduct
 	}
-	p.ID, p.Name, p.Currency = ld.SKU, name, "EUR"
-	p.Brand = brandName(ld.Brand.Name)
-	avail := strings.ToLower(ld.Offers.Availability)
+	p.ID, p.Name, p.Currency = ld.SKU.String(), name, "EUR"
+	p.Brand = brandName(ld.Brand)
+	offer := firstOffer(ld.Offers)
+	avail := strings.ToLower(offer.Availability)
 	p.Available = !strings.Contains(avail, "outofstock") && !strings.Contains(avail, "discontinued") && !strings.Contains(avail, "soldout")
-	if v, err := strconv.ParseFloat(ld.Offers.Price, 64); err == nil && v > 0 { // 0 means the shop sells it nowhere near the default store
+	if v, err := strconv.ParseFloat(offer.Price.String(), 64); err == nil && v > 0 { // 0 means the shop sells it nowhere near the default store
 		p.Price = &v
 	}
 	n, unit, ok := parseNutrition(page)
@@ -239,11 +244,38 @@ func parseProduct(page string) (product, error) {
 	return p, nil
 }
 
-// brandName turns «CONAD» into «Conad».
-func brandName(s string) string {
+type offer struct {
+	Price        json.Number `json:"price"`
+	Availability string      `json:"availability"`
+}
+
+// firstOffer reads schema.org's offers: one offer or a list of them, the price a string or
+// a number.
+func firstOffer(raw json.RawMessage) offer {
+	var o offer
+	if json.Unmarshal(raw, &o) == nil {
+		return o
+	}
+	var list []offer
+	if json.Unmarshal(raw, &list) == nil && len(list) > 0 {
+		return list[0]
+	}
+	return offer{}
+}
+
+// brandName reads schema.org's brand, a name or an object with one, and turns «CONAD» into «Conad».
+func brandName(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		var o struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(raw, &o)
+		s = o.Name
+	}
 	s = strings.TrimSpace(s)
-	if s != "" && s == strings.ToUpper(s) {
-		return strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
+	if r := []rune(s); len(r) > 0 && s == strings.ToUpper(s) {
+		return strings.ToUpper(string(r[:1])) + strings.ToLower(string(r[1:]))
 	}
 	return s
 }

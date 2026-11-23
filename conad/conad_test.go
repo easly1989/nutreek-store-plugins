@@ -231,3 +231,88 @@ func TestLimiterSpacesRequests(t *testing.T) {
 		t.Error("a cancelled wait must return an error")
 	}
 }
+
+func TestNumber(t *testing.T) {
+	for in, want := range map[string]float64{"0,2": 0.2, "1.250,5": 1250.5, "1.250": 1250, "1.5": 1.5, "12": 12, "0,50": 0.5, "12.500.000": 12500000} {
+		if got, ok := number(in); !ok || got != want {
+			t.Errorf("number(%q) = %v, %v; want %v", in, got, ok, want)
+		}
+	}
+	if q, u, ok := parseSize("Acqua 1.5 l"); !ok || q != 1500 || u != "ml" {
+		t.Errorf("a dot decimal in a name: %v %q %v", q, u, ok)
+	}
+}
+
+func TestParseProductIsLenient(t *testing.T) {
+	// schema.org allows a number for the price, a list of offers and a plain-string brand.
+	page := `<html><head><script type="application/ld+json">{"@type":"Product","sku":109725,"brand":"ÀMICI","offers":[{"price":1.2,"availability":"https://schema.org/OutOfStock"}]}</script></head><body><h1>Pasta 500 g</h1></body></html>`
+	p, err := parseProduct(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ID != "109725" || p.Brand != "Àmici" || p.Price == nil || *p.Price != 1.2 || p.Available {
+		t.Errorf("product = %+v price %v", p.Product, p.Price)
+	}
+}
+
+func TestLimiterGivesBackAndRefuses(t *testing.T) {
+	l := newLimiter(time.Hour)
+	_ = l.wait(context.Background()) // the first turn is now
+	// A caller that would have to wait past its deadline is refused at once and takes no turn.
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	for i := 0; i < 50; i++ {
+		if err := l.wait(short); err == nil {
+			t.Fatal("a turn an hour away was given to a 50 ms caller")
+		}
+	}
+	l.mu.Lock()
+	ahead := l.next.Sub(time.Now())
+	l.mu.Unlock()
+	if ahead > time.Hour+time.Second {
+		t.Errorf("refused callers pushed the next turn %v ahead", ahead)
+	}
+	// One that waits and is cancelled gives its turn back.
+	l2 := newLimiter(200 * time.Millisecond)
+	_ = l2.wait(context.Background())
+	ctx, cancel2 := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel2() }()
+	l2.mu.Lock()
+	before := l2.next
+	l2.mu.Unlock()
+	if err := l2.wait(ctx); err == nil {
+		t.Fatal("a cancelled wait returned no error")
+	}
+	l2.mu.Lock()
+	after := l2.next
+	l2.mu.Unlock()
+	if !after.Equal(before) {
+		t.Errorf("the cancelled turn was not given back: %v then %v", before, after)
+	}
+}
+
+func TestPanicInAPageDoesNotEscape(t *testing.T) {
+	s := newStore(t, "http://127.0.0.1:1")
+	s.each(context.Background(), 3, func(i int) { panic("boom") }) // must return, not crash the test binary
+}
+
+func TestNotAProductPageIsRememberedBriefly(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("<html>maintenance</html>"))
+	}))
+	defer srv.Close()
+	s := newStore(t, srv.URL)
+	for i := 0; i < 3; i++ {
+		if _, err := s.product(context.Background(), "109725"); err != errNotFound {
+			t.Fatalf("err = %v", err)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Errorf("a missing product was asked %d times in a row", hits.Load())
+	}
+	if e, ok := s.products.m["109725"]; !ok || time.Until(e.till) > 3*time.Minute {
+		t.Errorf("a page that is not a product is kept for %v", time.Until(e.till))
+	}
+}

@@ -31,8 +31,9 @@ const DefaultBase = "https://spesaonline.conad.it"
 const (
 	maxPage     = 3 << 20 // a page is read up to 3 MiB
 	maxResults  = 8       // products a search returns
-	maxIDs      = 40      // products an availability call looks at
+	maxIDs      = 50      // products an availability call looks at (as many as Nutreek asks)
 	concurrency = 3       // pages fetched at once
+	missingTTL  = 2 * time.Minute
 )
 
 // Options tunes a Store; the zero value is what production uses.
@@ -148,7 +149,9 @@ func (s *Store) product(ctx context.Context, id string) (product, error) {
 		return p, nil
 	}
 	missing := func() (product, error) {
-		s.products.put(id, product{missing: true}) // not asked again for a while
+		// Not asked again for a short while: a page that is not a product may be a hiccup of
+		// the site, and must not blank the product for as long as a good page is kept.
+		s.products.putFor(id, product{missing: true}, missingTTL)
 		return product{}, errNotFound
 	}
 	page, err := s.get(ctx, "/p/x--"+id)
@@ -243,7 +246,11 @@ func (s *Store) each(ctx context.Context, n int, f func(i int)) {
 		sem <- struct{}{}
 		wg.Add(1)
 		go func() {
-			defer func() { <-sem; wg.Done() }()
+			defer func() {
+				_ = recover() // a page the parser chokes on loses that product, not the process
+				<-sem
+				wg.Done()
+			}()
 			f(i)
 		}()
 	}

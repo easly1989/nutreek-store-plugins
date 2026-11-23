@@ -22,7 +22,13 @@ func (l *limiter) wait(ctx context.Context) error {
 		l.next = now
 	}
 	at := l.next
-	l.next = l.next.Add(l.gap)
+	// A turn that would come after the caller gives up is not taken: one slow burst of
+	// requests must not push every later request past its own deadline.
+	if dl, ok := ctx.Deadline(); ok && at.After(dl) {
+		l.mu.Unlock()
+		return context.DeadlineExceeded
+	}
+	l.next = at.Add(l.gap)
 	l.mu.Unlock()
 	d := at.Sub(now)
 	if d <= 0 {
@@ -34,6 +40,11 @@ func (l *limiter) wait(ctx context.Context) error {
 	case <-t.C:
 		return nil
 	case <-ctx.Done():
+		l.mu.Lock() // the turn is given back when it is still the last one
+		if l.next.Equal(at.Add(l.gap)) {
+			l.next = at
+		}
+		l.mu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -67,7 +78,10 @@ func (c *cache[V]) get(k string) (V, bool) {
 	return e.v, true
 }
 
-func (c *cache[V]) put(k string, v V) {
+func (c *cache[V]) put(k string, v V) { c.putFor(k, v, c.ttl) }
+
+// putFor keeps an entry for its own time, shorter than the cache's for what may be fixed soon.
+func (c *cache[V]) putFor(k string, v V, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.m) >= c.max {
@@ -84,5 +98,5 @@ func (c *cache[V]) put(k string, v V) {
 			delete(c.m, key)
 		}
 	}
-	c.m[k] = entry[V]{v: v, till: time.Now().Add(c.ttl)}
+	c.m[k] = entry[V]{v: v, till: time.Now().Add(ttl)}
 }
